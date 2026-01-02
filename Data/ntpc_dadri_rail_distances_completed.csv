@@ -1,0 +1,17 @@
+Plant / Vendor,Nearest Railhead (proxy),Shortest Rail Distance NDLS→Origin (km),Approx Rail Distance to Dadri DER (km),Method / Notes
+CENTRAL COALFIELDS LTD,BRKA — Barkakana Jn,1191.22,1231.49,IndiaRailInfo shortest route NDLS→BRKA
+NTPC LIMITED PAKRI-BARWADIH CO,BRWD — Barwadih Jn,1048.0,1088.27,RailYatri/Paytm range 1048–1058 km; using 1048 as proxy
+EASTERN COAL FIELDS LIMITED,UDL — Andal Jn,1260.23,1300.5,IndiaRailInfo shortest route NDLS→UDL
+BHARAT COKING COAL LIMITED,DHN — Dhanbad Jn,1177.66,1217.93,IndiaRailInfo shortest route NDLS↔DHN ~1176–1178 km
+FA & CAO NORTH CENTRAL RAILWAY,,,,Not a plant/sourcing location → N/A
+ARAVALI POWER COMPANY PVT TD,JRL — Jharli (Jhajjar),132.0,172.27,Makemytrip/route comp ~132 km NDLS→JRL
+MEJA URJA NIGAM PRIVATE LIMITE,MJA — Meja Road,668.0,708.27,IndiaRailInfo DLI→MJA shortest ≈665–669 km; using 668 km
+NORTHERN COALFIELDS LTD,SGRL — Singrauli,1074.0,1114.27,TrainSPNRStatus/Paytm ≈1072–1074 km NDLS→SGRL
+Bongaigaon Thermal Power,SLKX — Salakati (via NBQ),1687.76,1728.03,IndiaRailInfo NDLS→NBQ 1669.76 km + NBQ→SLKX ~18 km
+Mouda Super Thermal Power,RMT — Ramtek,848.0,888.27,Goibibo/eRail ≈847–848 km NDLS→RMT (Nagpur region)
+Bhartiya Rail Bijlee Company L,NBG — Nabinagar Road,927.9,968.17,IndiaRailInfo shortest NDLS→NBG ≈927.9 km
+Nabinagar Power genrating Comp,NBG — Nabinagar Road (NPGA sdg),927.9,968.17,Use NBG as proxy for NPGA siding
+Feroz Gandhi Unchahar  Thermal,UCR — Unchahar Jn,566.0,606.27,IndiaRailInfo NDLS/DLI→UCR ≈566 km
+Tanda Thermal Power Project,TTPH — Tanda TPH (proxy ABP),678.36,718.63,TTPH is a siding near Akbarpur; use NDLS→ABP shortest 678.36 km
+Farakka Super Thermal Power,NFK — New Farakka Jn,1313.94,1354.21,IndiaRailInfo NDLS→NFK 1313.94 km
+Gadarwara STPP,GAR — Gadarwara,910.33,950.6,IndiaRailInfo GAR→NDLS 910.33 km (symmetric)
