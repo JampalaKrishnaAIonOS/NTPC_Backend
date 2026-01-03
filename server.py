@@ -64,6 +64,10 @@ app = FastAPI(
     version="3.0.0"
 )
 
+# Initialize server state for caching
+app.state.server_cache = {}
+app.state.cache_lock = threading.Lock()
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -135,52 +139,31 @@ def get_all_data():
     cached object until the server process is restarted or the cache is cleared
     via `/api/cache/clear`.
     """
-    # Use a module-level cache to persist data while server is running
-    try:
-        global _SERVER_CACHE
-    except NameError:
-        # initialize cache and lock on first use
-        _SERVER_CACHE = {}
-        _CACHE_LOCK = threading.Lock()
+    # Use app.state for better lifecycle management and concurrency
+    if '_all_data' in app.state.server_cache:
+        return app.state.server_cache['_all_data']
 
-    # Use a lock for simple thread-safety
-    if '_all_data' in _SERVER_CACHE:
-        return _SERVER_CACHE['_all_data']
-
-    with _CACHE_LOCK:
-        if '_all_data' in _SERVER_CACHE:
-            return _SERVER_CACHE['_all_data']
+    with app.state.cache_lock:
+        if '_all_data' in app.state.server_cache:
+            return app.state.server_cache['_all_data']
         data = load_data()
-        _SERVER_CACHE['_all_data'] = data
+        app.state.server_cache['_all_data'] = data
         return data
 
 
 # Helper cache accessors for other computed payloads
 def _get_cached(key: str):
-    try:
-        return _SERVER_CACHE.get(key)
-    except NameError:
-        return None
+    return app.state.server_cache.get(key)
 
 def _set_cached(key: str, value: Any):
-    try:
-        _SERVER_CACHE[key] = value
-    except NameError:
-        # initialize and set
-        global _SERVER_CACHE, _CACHE_LOCK
-        _SERVER_CACHE = {}
-        _CACHE_LOCK = threading.Lock()
-        _SERVER_CACHE[key] = value
+    app.state.server_cache[key] = value
 
 def _clear_cache(key: Optional[str] = None):
-    try:
-        if key:
-            _SERVER_CACHE.pop(key, None)
-        else:
-            _SERVER_CACHE.clear()
-        return True
-    except NameError:
-        return False
+    if key:
+        app.state.server_cache.pop(key, None)
+    else:
+        app.state.server_cache.clear()
+    return True
 
 def filter_ntpc_vendors(df: pd.DataFrame) -> pd.DataFrame:
     """Filter for NTPC vendors only"""
@@ -873,3 +856,4 @@ async def list_endpoints():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
