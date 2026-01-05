@@ -673,7 +673,29 @@ async def validate_data_upload(file: UploadFile = File(...)):
 @app.post("/api/chat")
 async def chat_with_assistant(question: str = Form(...), dataset: str = Form("")):
     """Chatbot endpoint"""
-    return JSONResponse(process_chat_query(question, dataset if dataset else ""))
+    response = process_chat_query(question, dataset if dataset else "")
+    
+    # 🔒 Force-safe JSON serialization to handle NaN, Infinity, etc.
+    try:
+        import json
+        safe_content = json.loads(
+            json.dumps(response, default=str, allow_nan=False)
+        )
+    except ValueError:
+        # If allow_nan=False still fails, we manually sanitize the data
+        # This is a double-safe fallback
+        def sanitize(obj):
+            if isinstance(obj, float):
+                if math.isnan(obj) or math.isinf(obj):
+                    return None
+            elif isinstance(obj, dict):
+                return {k: sanitize(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [sanitize(x) for x in obj]
+            return obj
+        safe_content = sanitize(response)
+
+    return JSONResponse(content=safe_content)
 
 @app.get("/api/datasets")
 async def list_datasets():
@@ -856,4 +878,3 @@ async def list_endpoints():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
