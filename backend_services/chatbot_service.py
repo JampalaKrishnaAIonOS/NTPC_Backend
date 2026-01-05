@@ -76,9 +76,6 @@ def get_database_connection(dataset_name: Optional[str] = None):
     if CONN is None:
         CONN = duckdb.connect(":memory:")
     
-    # We ignore dataset_name for now as we want to enforce using the centralized data loader
-    # This ensures consistency between dashboard and chatbot
-    
     if CURRENT_DATASET is None:
         try:
             print("Chatbot loading data via data_loader...")
@@ -89,13 +86,37 @@ def get_database_connection(dataset_name: Optional[str] = None):
             
             df = data_dict['coal_receipt'].copy()
 
-            # Normalize column names
+            # ✅ STEP 1: Replace problematic string values FIRST
+            df = df.replace(['<NA>', 'nan', 'NaN', 'None', 'null', ''], np.nan)
+            
+            # ✅ STEP 2: Identify and convert numeric columns
+            for col in df.columns:
+                # Check if column should be numeric based on name patterns
+                col_lower = col.lower()
+                if any(keyword in col_lower for keyword in ['qty', 'val', 'cost', 'price', 'amount', 'total', 'gross', 'net']):
+                    try:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    except:
+                        pass
+            
+            # ✅ STEP 3: Convert date columns
+            for col in df.columns:
+                if 'date' in col.lower() or 'dt' in col.lower():
+                    try:
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
+                    except:
+                        pass
+            
+            # ✅ STEP 4: Normalize column names AFTER cleaning
             df.columns = [normalize_column(c) for c in df.columns]
             
-            # Register as 'data' table in DuckDB
+            # ✅ STEP 5: Fill NaN in critical numeric columns with 0
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            df[numeric_cols] = df[numeric_cols].fillna(0)
+            
+            # ✅ STEP 6: Register in DuckDB
             CONN.register("data", df)
             
-            # Optional: Register other tables if needed
             if 'coal_stock' in data_dict:
                 CONN.register("stock", data_dict['coal_stock'])
             
@@ -316,119 +337,322 @@ SQL Query:"""
         print(f"Error in SQL generation: {e}")
         raise RuntimeError("LLM SQL generation failed – check schema or prompt.")
 
-def create_visualization_from_data(df: pd.DataFrame, question: str) -> Optional[str]:
-    """Create visualization from data with enhanced chart intent routing and intelligence"""
-    if df.empty or len(df.columns) < 1:
-        return None
+def validate_chart_feasibility(chart_type: str, date_cols: list, cat_cols: list, num_cols: list) -> bool:
+    """Check if the requested chart type is possible with current data structure"""
+    if chart_type == "line":
+        return len(date_cols) > 0 and len(num_cols) > 0
+    if chart_type == "bar":
+        return len(cat_cols) > 0 and len(num_cols) > 0
+    if chart_type == "pie":
+        return len(cat_cols) > 0 and len(num_cols) > 0
+    if chart_type == "scatter":
+        return len(num_cols) >= 2
+    return False
+
+
+def select_chart_with_ai(df: pd.DataFrame, question: str, date_cols, cat_cols, num_cols) -> str:
+    """Use AI to intelligently select chart type"""
+    data_summary = f"""
+Data has:
+- {len(date_cols)} date/time columns: {date_cols[:3]}
+- {len(cat_cols)} categorical columns: {cat_cols[:3]}
+- {len(num_cols)} numeric columns: {num_cols[:3]}
+- {len(df)} rows
+
+Question: "{question}"
+"""
+    
+    prompt = f"""You are a data visualization expert. Select the BEST chart type.
+
+{data_summary}
+
+Chart Types:
+- "line": For trends over TIME (requires date column)
+- "bar": For COMPARING categories (requires categorical column)
+- "pie": For showing DISTRIBUTION/SHARES (max 10 categories)
+- "scatter": For showing CORRELATION between two numbers
+
+Rules:
+- If question mentions "trend", "over time", "monthly", "daily" → line
+- If question mentions "compare", "top", "by vendor", "breakdown" → bar
+- If question mentions "distribution", "share", "percentage" → pie
+- If data has dates → prefer line
+- If data has categories → prefer bar
+
+Return ONLY one word: line, bar, pie, or scatter"""
     
     try:
-        question_lower = question.lower()
+        message = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=10
+        )
         
-        # 1. Comprehensive Column Classification
-        # Temporal candidates: Date-like strings or datetime objects
-        date_cols = [
-            c for c in df.columns 
-            if 'date' in c.lower() or 'dt' in c.lower() or 'time' in c.lower() or 
-            pd.api.types.is_datetime64_any_dtype(df[c])
-        ]
+        result = message.choices[0].message.content.strip().lower()
         
-        # Categorical candidates: Objects/strings that aren't dates
-        cat_cols = [
-            c for c in df.columns 
-            if (df[c].dtype == 'object' or str(df[c].dtype) == 'category') 
-            and c not in date_cols
-        ]
+        # Extract chart type from response
+        for chart_type in ["line", "bar", "pie", "scatter"]:
+            if chart_type in result:
+                return chart_type
         
-        # Numerical candidates
+        return "bar"  # default
+    except Exception as e:
+        print(f"AI Chart selection request failed: {e}")
+        return "bar"
+
+
+def auto_select_chart_fallback(df: pd.DataFrame, question: str, date_cols, cat_cols, num_cols) -> str:
+    """Fallback chart selection without AI"""
+    q = question.lower()
+    
+    # Keyword-based selection
+    if any(kw in q for kw in ["trend", "over time", "monthly", "daily", "timeline"]) and date_cols:
+        return "line"
+    
+    if any(kw in q for kw in ["distribution", "share", "percentage", "pie"]) and cat_cols:
+        return "pie"
+    
+    if any(kw in q for kw in ["compare", "top", "vendor", "breakdown", "by"]) and cat_cols:
+        return "bar"
+    
+    # Data-based selection
+    if date_cols and num_cols:
+        return "line"
+    
+    if cat_cols and num_cols:
+        return "bar"
+    
+    return "bar"  # ultimate fallback
+
+
+def create_line_chart(df: pd.DataFrame, x_col: str, y_col: str) -> Optional[go.Figure]:
+    """Create line chart for time series with robust error handling"""
+    try:
+        # Ensure datetime
+        if not pd.api.types.is_datetime64_any_dtype(df[x_col]):
+            try:
+                df[x_col] = pd.to_datetime(df[x_col], errors='coerce')
+            except:
+                print(f"Could not convert {x_col} to datetime")
+                return None
+        
+        # Remove NaT and null values
+        df_clean = df[[x_col, y_col]].dropna().copy()
+        
+        if df_clean.empty:
+            print(f"No valid data after cleaning for line chart")
+            return None
+        
+        # Sort by date
+        df_clean = df_clean.sort_values(x_col).head(100)
+        
+        fig = px.line(
+            df_clean, 
+            x=x_col, 
+            y=y_col,
+            title=f"Trend: {y_col} over {x_col}",
+            markers=True,
+            color_discrete_sequence=['#2563EB']
+        )
+        return fig
+    except Exception as e:
+        print(f"Error creating line chart: {e}")
+        return None
+
+
+def create_bar_chart(df: pd.DataFrame, x_col: str, y_col: str) -> Optional[go.Figure]:
+    """Create bar chart for comparisons with robust error handling"""
+    try:
+        # Remove nulls first
+        df_clean = df[[x_col, y_col]].dropna().copy()
+        
+        if df_clean.empty:
+            print(f"No valid data after cleaning for bar chart")
+            return None
+        
+        # Aggregate if there are duplicate categories
+        if len(df_clean) > df_clean[x_col].nunique():
+            df_agg = df_clean.groupby(x_col)[y_col].sum().reset_index()
+        else:
+            df_agg = df_clean.copy()
+        
+        # Sort and limit
+        df_agg = df_agg.sort_values(y_col, ascending=False).head(15)
+        
+        if df_agg.empty or len(df_agg) == 0:
+            print(f"No data after aggregation for bar chart")
+            return None
+        
+        fig = px.bar(
+            df_agg,
+            x=x_col,
+            y=y_col,
+            title=f"Comparison: {y_col} by {x_col}",
+            color=x_col,  # Each bar gets its own color based on category
+            color_discrete_sequence=px.colors.qualitative.Prism
+        )
+        fig.update_layout(showlegend=False, xaxis_tickangle=-45)
+        return fig
+    except Exception as e:
+        print(f"Error creating bar chart: {e}")
+        return None
+
+
+def create_pie_chart(df: pd.DataFrame, names_col: str, values_col: str) -> Optional[go.Figure]:
+    """Create pie chart for distributions with robust error handling"""
+    try:
+        # Remove nulls
+        df_clean = df[[names_col, values_col]].dropna().copy()
+        
+        if df_clean.empty:
+            print(f"No valid data after cleaning for pie chart")
+            return None
+        
+        # Aggregate by category
+        df_agg = df_clean.groupby(names_col)[values_col].sum().reset_index()
+        df_agg = df_agg.sort_values(values_col, ascending=False).head(10)
+        
+        if df_agg.empty or len(df_agg) == 0:
+            print(f"No data after aggregation for pie chart")
+            return None
+        
+        # Filter out zero values
+        df_agg = df_agg[df_agg[values_col] > 0]
+        
+        if df_agg.empty:
+            print(f"No non-zero values for pie chart")
+            return None
+        
+        fig = px.pie(
+            df_agg,
+            names=names_col,
+            values=values_col,
+            title=f"Distribution: {values_col} by {names_col}",
+            hole=0.3,
+            color_discrete_sequence=px.colors.qualitative.Set3
+        )
+        return fig
+    except Exception as e:
+        print(f"Error creating pie chart: {e}")
+        return None
+
+
+def create_scatter_chart(df: pd.DataFrame, x_col: str, y_col: str) -> Optional[go.Figure]:
+    """Create scatter plot for correlations with robust error handling"""
+    try:
+        # Remove nulls
+        df_clean = df[[x_col, y_col]].dropna().copy()
+        
+        if df_clean.empty or len(df_clean) < 2:
+            print(f"Not enough data for scatter plot (need at least 2 points)")
+            return None
+        
+        # Limit to reasonable number of points
+        df_clean = df_clean.head(200)
+        
+        fig = px.scatter(
+            df_clean,
+            x=x_col,
+            y=y_col,
+            title=f"Correlation: {y_col} vs {x_col}",
+            color_discrete_sequence=['#10b981']
+        )
+        return fig
+    except Exception as e:
+        print(f"Error creating scatter chart: {e}")
+        return None
+
+
+def create_simple_bar(df: pd.DataFrame) -> Optional[go.Figure]:
+    """Fallback: simple bar of first columns with robust error handling"""
+    try:
+        if df.empty or len(df.columns) < 2:
+            print("Not enough data for simple bar chart")
+            return None
+        
+        # Use first two columns
+        x_col = df.columns[0]
+        y_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+        
+        # Remove nulls
+        df_clean = df[[x_col, y_col]].dropna().head(15)
+        
+        if df_clean.empty:
+            print("No valid data for simple bar chart")
+            return None
+        
+        fig = px.bar(
+            df_clean,
+            x=x_col,
+            y=y_col,
+            title="Data Overview",
+            color=x_col,
+            color_discrete_sequence=px.colors.qualitative.Vivid
+        )
+        fig.update_layout(showlegend=False)
+        return fig
+    except Exception as e:
+        print(f"Error creating simple bar chart: {e}")
+        return None
+
+
+def create_visualization_from_data(df: pd.DataFrame, question: str) -> Optional[Dict[str, Any]]:
+    """Create visualization with feasibility checks and explicit error reporting"""
+    if df.empty or len(df.columns) < 1:
+        return {"error": "Dataset is empty", "type": "error"}
+    
+    try:
+        # ✅ HARD SANITIZE numeric columns (Stop NaN/Inf crashes)
         num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        for col in num_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col] = df[col].replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        # Classify columns
+        date_cols = [c for c in df.columns 
+                    if 'date' in c.lower() or 'dt' in c.lower() or 
+                    pd.api.types.is_datetime64_any_dtype(df[c])]
+        
+        cat_cols = [c for c in df.columns 
+                   if (df[c].dtype == 'object' or str(df[c].dtype) == 'category') 
+                   and c not in date_cols]
         
         if not num_cols:
-            return None # Can't visualize without numbers
-            
-        # 2. Logic-Based Intent Routing
-        # Default chart type decided by keywords or data shape
-        intent = "bar" # Default
-        if "pie" in question_lower:
-            intent = "pie"
-        elif any(k in question_lower for k in ["line", "trend", "over time", "monthly", "daily"]):
-            intent = "line"
-        elif any(k in question_lower for k in ["scatter", "relation", "vs"]):
-            intent = "scatter"
-        elif "bar" in question_lower or "histogram" in question_lower:
-            intent = "bar"
-        elif date_cols and not cat_cols:
-            intent = "line" # Auto-select line for time series
-        elif cat_cols and len(df) <= 10 and not date_cols:
-            # If specifically asked or small data, pie is a good default
-            if "pie" in question_lower: intent = "pie"
-            
-        # 3. Chart Generation Logic
-        fig = None
-        
-        # TIME SERIES / LINE CHART
-        if intent == "line" and date_cols:
-            x_col = date_cols[0]
-            y_col = num_cols[0]
-            # Convert to datetime for proper sorting if it's not already
-            if not pd.api.types.is_datetime64_any_dtype(df[x_col]):
-                try:
-                    df[x_col] = pd.to_datetime(df[x_col])
-                except:
-                    pass
-            df_plot = df.sort_values(x_col).head(100)
-            fig = px.line(
-                df_plot, x=x_col, y=y_col, 
-                title=f"Trend Analysis: {y_col} over {x_col}",
-                markers=True,
-                color_discrete_sequence=px.colors.qualitative.Set3
-            )
-            
-        # DISTRIBUTION / PIE CHART
-        elif intent == "pie" and cat_cols:
-            x_col = cat_cols[0]
-            y_col = num_cols[0]
-            df_plot = df.groupby(x_col)[y_col].sum().reset_index().sort_values(y_col, ascending=False).head(10)
-            fig = px.pie(
-                df_plot, names=x_col, values=y_col, 
-                title=f"Distribution: {y_col} by {x_col}",
-                hole=0.4,
-                color_discrete_sequence=px.colors.qualitative.Set3
-            )
-            
-        # RELATION / SCATTER CHART
-        elif intent == "scatter" and len(num_cols) >= 2:
-            fig = px.scatter(
-                df.head(200), x=num_cols[0], y=num_cols[1],
-                color=cat_cols[0] if cat_cols else None,
-                title=f"Correlation: {num_cols[1]} vs {num_cols[0]}",
-                color_discrete_sequence=px.colors.qualitative.Set3
-            )
+            return {"error": "No numeric data available for charting", "type": "error"}
 
-        # COMPARISON / BAR CHART (DEFAULT)
-        elif cat_cols:
-            x_col = cat_cols[0]
-            y_col = num_cols[0]
-            # Aggregate if there are many rows per category
-            if len(df) > len(df[x_col].unique()):
-                df_plot = df.groupby(x_col)[y_col].sum().reset_index().sort_values(y_col, ascending=False).head(15)
-            else:
-                df_plot = df.sort_values(y_col, ascending=False).head(15)
-                
-            fig = px.bar(
-                df_plot, x=x_col, y=y_col, 
-                color=x_col,
-                title=f"Comparison: {y_col} by {x_col}",
-                color_discrete_sequence=px.colors.qualitative.Set3
-            )
-            fig.update_layout(showlegend=False, xaxis_tickangle=-45)
-            
-        # FALLBACK: Use first two columns regardless of type for a bar chart
-        elif len(df.columns) >= 2:
-            fig = px.bar(
-                df.head(15), x=df.columns[0], y=df.columns[1],
-                title="Data Overview",
-                color_discrete_sequence=px.colors.qualitative.Set3
-            )
+        # USE AI TO SELECT CHART TYPE
+        q = question.lower()
+        if groq_client:
+            try:
+                chart_type = select_chart_with_ai(df, question, date_cols, cat_cols, num_cols)
+            except:
+                chart_type = auto_select_chart_fallback(df, question, date_cols, cat_cols, num_cols)
+        else:
+            chart_type = auto_select_chart_fallback(df, question, date_cols, cat_cols, num_cols)
+
+        # ✅ ENFORCE CHART PRECONDITIONS
+        if not validate_chart_feasibility(chart_type, date_cols, cat_cols, num_cols):
+            print(f"Requested {chart_type} is not feasible. Falling back...")
+            chart_type = auto_select_chart_fallback(df, question, date_cols, cat_cols, num_cols)
+
+        # Final validation after fallback
+        if not validate_chart_feasibility(chart_type, date_cols, cat_cols, num_cols):
+            # If still not feasible, try to find ANY valid chart
+            if date_cols and num_cols: chart_type = "line"
+            elif cat_cols and num_cols: chart_type = "bar"
+            else: return {"error": "Data structure does not support standard charts", "type": "error"}
+
+        # Create chart based on type
+        fig = None
+        if chart_type == "line":
+            fig = create_line_chart(df, date_cols[0], num_cols[0])
+        elif chart_type == "pie":
+            fig = create_pie_chart(df, cat_cols[0], num_cols[0])
+        elif chart_type == "bar":
+            fig = create_bar_chart(df, cat_cols[0], num_cols[0])
+        elif chart_type == "scatter":
+            fig = create_scatter_chart(df, num_cols[0], num_cols[1])
 
         if fig:
             fig.update_layout(
@@ -436,12 +660,32 @@ def create_visualization_from_data(df: pd.DataFrame, question: str) -> Optional[
                 template="plotly_white",
                 margin=dict(l=40, r=40, t=60, b=40)
             )
-            return json.dumps(fig, cls=PlotlyJSONEncoder)
+            
+            # Extract spec info for frontend (Mini-Wren style)
+            spec = {
+                "type": chart_type,
+                "x": date_cols[0] if chart_type == "line" else (cat_cols[0] if cat_cols else None),
+                "y": num_cols[0] if num_cols else None,
+                "title": fig.layout.title.text if fig.layout.title else None
+            }
+            
+            # Return spec + plotly json
+            return {
+                "spec": spec,
+                "plotly_json": json.loads(json.dumps(fig, cls=PlotlyJSONEncoder)),
+                "success": True
+            }
+        else:
+            return {
+                "error": f"Failed to render {chart_type} despite feasibility check",
+                "type": "error",
+                "success": False
+            }
             
     except Exception as e:
-        print(f"Error creating visualization: {e}")
-    
-    return None
+        print(f"Critical error in visualization: {e}")
+        return {"error": str(e), "type": "error"}
+
 
 
 def generate_conversational_response(question: str) -> str:
@@ -554,9 +798,11 @@ def process_chat_query(question: str, dataset_name: str = "") -> Dict[str, Any]:
             "trend": """
                 SELECT 
                     CAST(entry_dt AS DATE) as date,
-                    SUM(gr_qty) as quantity,
-                    SUM(gross_total_coal_z_tot_p_val + gross_total_rail_z_tot_p_val) as total_cost
+                    COALESCE(SUM(gr_qty), 0) as quantity,
+                    COALESCE(SUM(gross_total_coal_z_tot_p_val), 0) + 
+                    COALESCE(SUM(gross_total_rail_z_tot_p_val), 0) as total_cost
                 FROM data
+                WHERE entry_dt IS NOT NULL
                 GROUP BY 1
                 ORDER BY 1
                 LIMIT 100
@@ -564,10 +810,11 @@ def process_chat_query(question: str, dataset_name: str = "") -> Dict[str, Any]:
             "vendor": """
                 SELECT
                     coal_vendor,
-                    SUM(gr_qty) AS total_quantity,
-                    SUM(gross_total_coal_z_tot_p_val) AS coal_cost,
-                    SUM(gross_total_rail_z_tot_p_val) AS freight_cost
+                    COALESCE(SUM(gr_qty), 0) AS total_quantity,
+                    COALESCE(SUM(gross_total_coal_z_tot_p_val), 0) AS coal_cost,
+                    COALESCE(SUM(gross_total_rail_z_tot_p_val), 0) AS freight_cost
                 FROM data
+                WHERE coal_vendor IS NOT NULL
                 GROUP BY coal_vendor
                 ORDER BY coal_cost DESC
                 LIMIT 20
@@ -575,9 +822,10 @@ def process_chat_query(question: str, dataset_name: str = "") -> Dict[str, Any]:
             "supplier": """
                 SELECT
                     coal_vendor,
-                    SUM(gr_qty) AS total_quantity,
-                    SUM(gross_total_coal_z_tot_p_val) AS coal_cost
+                    COALESCE(SUM(gr_qty), 0) AS total_quantity,
+                    COALESCE(SUM(gross_total_coal_z_tot_p_val), 0) AS coal_cost
                 FROM data
+                WHERE coal_vendor IS NOT NULL
                 GROUP BY coal_vendor
                 ORDER BY coal_cost DESC
                 LIMIT 20
@@ -585,9 +833,10 @@ def process_chat_query(question: str, dataset_name: str = "") -> Dict[str, Any]:
             "freight": """
                 SELECT
                     coal_vendor,
-                    SUM(gross_total_rail_z_tot_p_val) AS freight_cost,
-                    SUM(gr_qty) AS total_quantity
+                    COALESCE(SUM(gross_total_rail_z_tot_p_val), 0) AS freight_cost,
+                    COALESCE(SUM(gr_qty), 0) AS total_quantity
                 FROM data
+                WHERE coal_vendor IS NOT NULL
                 GROUP BY coal_vendor
                 ORDER BY freight_cost DESC
                 LIMIT 20
@@ -595,9 +844,10 @@ def process_chat_query(question: str, dataset_name: str = "") -> Dict[str, Any]:
             "quantity": """
                 SELECT
                     coal_vendor,
-                    SUM(gr_qty) AS total_quantity,
-                    SUM(gross_total_coal_z_tot_p_val) AS coal_cost
+                    COALESCE(SUM(gr_qty), 0) AS total_quantity,
+                    COALESCE(SUM(gross_total_coal_z_tot_p_val), 0) AS coal_cost
                 FROM data
+                WHERE coal_vendor IS NOT NULL
                 GROUP BY coal_vendor
                 ORDER BY total_quantity DESC
                 LIMIT 20
@@ -605,9 +855,11 @@ def process_chat_query(question: str, dataset_name: str = "") -> Dict[str, Any]:
             "cost": """
                 SELECT
                     coal_vendor,
-                    SUM(gross_total_coal_z_tot_p_val + gross_total_rail_z_tot_p_val) as total_cost,
-                    SUM(gr_qty) as quantity
+                    COALESCE(SUM(gross_total_coal_z_tot_p_val), 0) + 
+                    COALESCE(SUM(gross_total_rail_z_tot_p_val), 0) as total_cost,
+                    COALESCE(SUM(gr_qty), 0) as quantity
                 FROM data
+                WHERE coal_vendor IS NOT NULL
                 GROUP BY 1
                 ORDER BY 2 DESC
                 LIMIT 15
@@ -623,10 +875,23 @@ def process_chat_query(question: str, dataset_name: str = "") -> Dict[str, Any]:
         # Fallback to LLM if no intent matched
         if not sql_query:
             sql_query = generate_sql_from_question(question, con)
+
+        # ✅ FIX 2: Lock SQL -> Chart intent (Internal Guard)
+        expected_chart = None
+        if "trend" in q or "over time" in q: expected_chart = "line"
+        elif "compare" in q or "vendor" in q: expected_chart = "bar"
+        elif "distribution" in q or "share" in q: expected_chart = "pie"
         
         # Execute query
         try:
             result_df = con.execute(sql_query).fetchdf()
+            
+            # Grain alignment check: If trend requested but no date, try more specific SQL
+            if expected_chart == "line" and not any('date' in c.lower() or 'dt' in c.lower() for c in result_df.columns):
+                print("Grain mismatch: Trend requested but no date column found. Retrying with explicit date SQL...")
+                sql_query = generate_sql_from_question(question + " (ensure you include a date column)", con)
+                result_df = con.execute(sql_query).fetchdf()
+            
             result_df = clean_dataframe_for_json(result_df)
             results = result_df.to_dict(orient='records')
             
@@ -658,8 +923,8 @@ def process_chat_query(question: str, dataset_name: str = "") -> Dict[str, Any]:
         
         # Create visualization
         print("DEBUG: Creating visualization...")
-        visualization = create_visualization_from_data(result_df, question)
-        print(f"DEBUG: Visualization created: {bool(visualization)}")
+        viz_result = create_visualization_from_data(result_df, question)
+        print(f"DEBUG: Visualization created: {bool(viz_result and viz_result.get('success'))}")
         
         return {
             "success": True,
@@ -669,7 +934,7 @@ def process_chat_query(question: str, dataset_name: str = "") -> Dict[str, Any]:
                 "data": {
                     "sql_query": sql_query,
                     "results": results,
-                    "visualization": visualization
+                    "visualization": viz_result
                 }
             },
             "dataset": CURRENT_DATASET
