@@ -289,7 +289,9 @@ INSTRUCTIONS:
 - Use EXACT table and column names
 - Add LIMIT 100 for results
 - Use proper GROUP BY when aggregating
-- Return ONLY the SQL query, no explanations
+- If the user asks for a TREND or OVER TIME, ensure you include a DATE/TIME column (like entry_dt) and GROUP BY/ORDER BY it.
+- If the user asks for a COMPARISON or DISTRIBUTION, ensure you include a CATEGORICAL column (like coal_vendor) and a NUMERICAL metric.
+- Return ONLY the SQL query, no explanations or markdown blocks.
 
 Question: "{question}"
 
@@ -315,74 +317,127 @@ SQL Query:"""
         raise RuntimeError("LLM SQL generation failed – check schema or prompt.")
 
 def create_visualization_from_data(df: pd.DataFrame, question: str) -> Optional[str]:
-    """Create visualization from data with chart intent routing"""
+    """Create visualization from data with enhanced chart intent routing and intelligence"""
     if df.empty or len(df.columns) < 1:
         return None
     
     try:
         question_lower = question.lower()
         
-        # Identify column types
-        cat_cols = [
-            c for c in df.columns
-            if df[c].dtype == 'object' or c.endswith('_vendor')
+        # 1. Comprehensive Column Classification
+        # Temporal candidates: Date-like strings or datetime objects
+        date_cols = [
+            c for c in df.columns 
+            if 'date' in c.lower() or 'dt' in c.lower() or 'time' in c.lower() or 
+            pd.api.types.is_datetime64_any_dtype(df[c])
         ]
-        num_cols = [col for col in df.columns if df[col].dtype in ['int64', 'float64']]
         
-        if not (cat_cols and num_cols):
-            return None
+        # Categorical candidates: Objects/strings that aren't dates
+        cat_cols = [
+            c for c in df.columns 
+            if (df[c].dtype == 'object' or str(df[c].dtype) == 'category') 
+            and c not in date_cols
+        ]
         
-        x_col = cat_cols[0]
-        y_col = num_cols[0]
-        df_sorted = df.sort_values(y_col, ascending=False).head(20)
+        # Numerical candidates
+        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         
-        # Chart intent routing
-        if "pie" in question_lower:
-            # Create pie chart with categorical coloring
-            fig = px.pie(
-                df_sorted,
-                names=x_col,
-                values=y_col,
-                color=x_col,
-                color_discrete_sequence=px.colors.qualitative.Set3,
-                title=f"Distribution: {y_col} by {x_col}",
-                hole=0.35
-            )
-            fig.update_layout(height=400)
+        if not num_cols:
+            return None # Can't visualize without numbers
             
-        elif "line" in question_lower or "trend" in question_lower:
-            # Create line chart
+        # 2. Logic-Based Intent Routing
+        # Default chart type decided by keywords or data shape
+        intent = "bar" # Default
+        if "pie" in question_lower:
+            intent = "pie"
+        elif any(k in question_lower for k in ["line", "trend", "over time", "monthly", "daily"]):
+            intent = "line"
+        elif any(k in question_lower for k in ["scatter", "relation", "vs"]):
+            intent = "scatter"
+        elif "bar" in question_lower or "histogram" in question_lower:
+            intent = "bar"
+        elif date_cols and not cat_cols:
+            intent = "line" # Auto-select line for time series
+        elif cat_cols and len(df) <= 10 and not date_cols:
+            # If specifically asked or small data, pie is a good default
+            if "pie" in question_lower: intent = "pie"
+            
+        # 3. Chart Generation Logic
+        fig = None
+        
+        # TIME SERIES / LINE CHART
+        if intent == "line" and date_cols:
+            x_col = date_cols[0]
+            y_col = num_cols[0]
+            # Convert to datetime for proper sorting if it's not already
+            if not pd.api.types.is_datetime64_any_dtype(df[x_col]):
+                try:
+                    df[x_col] = pd.to_datetime(df[x_col])
+                except:
+                    pass
+            df_plot = df.sort_values(x_col).head(100)
             fig = px.line(
-                df_sorted,
-                x=x_col,
-                y=y_col,
-                title=f"Trend: {y_col} by {x_col}",
+                df_plot, x=x_col, y=y_col, 
+                title=f"Trend Analysis: {y_col} over {x_col}",
                 markers=True,
                 color_discrete_sequence=px.colors.qualitative.Set3
             )
-            fig.update_layout(
-                xaxis_tickangle=-45,
-                height=400
+            
+        # DISTRIBUTION / PIE CHART
+        elif intent == "pie" and cat_cols:
+            x_col = cat_cols[0]
+            y_col = num_cols[0]
+            df_plot = df.groupby(x_col)[y_col].sum().reset_index().sort_values(y_col, ascending=False).head(10)
+            fig = px.pie(
+                df_plot, names=x_col, values=y_col, 
+                title=f"Distribution: {y_col} by {x_col}",
+                hole=0.4,
+                color_discrete_sequence=px.colors.qualitative.Set3
             )
             
-        else:
-            # Default: bar chart with categorical coloring
+        # RELATION / SCATTER CHART
+        elif intent == "scatter" and len(num_cols) >= 2:
+            fig = px.scatter(
+                df.head(200), x=num_cols[0], y=num_cols[1],
+                color=cat_cols[0] if cat_cols else None,
+                title=f"Correlation: {num_cols[1]} vs {num_cols[0]}",
+                color_discrete_sequence=px.colors.qualitative.Set3
+            )
+
+        # COMPARISON / BAR CHART (DEFAULT)
+        elif cat_cols:
+            x_col = cat_cols[0]
+            y_col = num_cols[0]
+            # Aggregate if there are many rows per category
+            if len(df) > len(df[x_col].unique()):
+                df_plot = df.groupby(x_col)[y_col].sum().reset_index().sort_values(y_col, ascending=False).head(15)
+            else:
+                df_plot = df.sort_values(y_col, ascending=False).head(15)
+                
             fig = px.bar(
-                df_sorted,
-                x=x_col,
-                y=y_col,
+                df_plot, x=x_col, y=y_col, 
                 color=x_col,
-                color_discrete_sequence=px.colors.qualitative.Set3,
-                title=f"Analysis: {y_col} by {x_col}"
+                title=f"Comparison: {y_col} by {x_col}",
+                color_discrete_sequence=px.colors.qualitative.Set3
             )
+            fig.update_layout(showlegend=False, xaxis_tickangle=-45)
+            
+        # FALLBACK: Use first two columns regardless of type for a bar chart
+        elif len(df.columns) >= 2:
+            fig = px.bar(
+                df.head(15), x=df.columns[0], y=df.columns[1],
+                title="Data Overview",
+                color_discrete_sequence=px.colors.qualitative.Set3
+            )
+
+        if fig:
             fig.update_layout(
-                xaxis_tickangle=-45,
-                height=400,
-                showlegend=False
+                height=450,
+                template="plotly_white",
+                margin=dict(l=40, r=40, t=60, b=40)
             )
-        
-        return json.dumps(fig, cls=PlotlyJSONEncoder)
-        
+            return json.dumps(fig, cls=PlotlyJSONEncoder)
+            
     except Exception as e:
         print(f"Error creating visualization: {e}")
     
@@ -496,6 +551,16 @@ def process_chat_query(question: str, dataset_name: str = "") -> Dict[str, Any]:
         
         # Intent-based SQL map for deterministic queries
         INTENT_SQL_MAP = {
+            "trend": """
+                SELECT 
+                    CAST(entry_dt AS DATE) as date,
+                    SUM(gr_qty) as quantity,
+                    SUM(gross_total_coal_z_tot_p_val + gross_total_rail_z_tot_p_val) as total_cost
+                FROM data
+                GROUP BY 1
+                ORDER BY 1
+                LIMIT 100
+            """,
             "vendor": """
                 SELECT
                     coal_vendor,
@@ -511,8 +576,7 @@ def process_chat_query(question: str, dataset_name: str = "") -> Dict[str, Any]:
                 SELECT
                     coal_vendor,
                     SUM(gr_qty) AS total_quantity,
-                    SUM(gross_total_coal_z_tot_p_val) AS coal_cost,
-                    SUM(gross_total_rail_z_tot_p_val) AS freight_cost
+                    SUM(gross_total_coal_z_tot_p_val) AS coal_cost
                 FROM data
                 GROUP BY coal_vendor
                 ORDER BY coal_cost DESC
@@ -537,6 +601,16 @@ def process_chat_query(question: str, dataset_name: str = "") -> Dict[str, Any]:
                 GROUP BY coal_vendor
                 ORDER BY total_quantity DESC
                 LIMIT 20
+            """,
+            "cost": """
+                SELECT
+                    coal_vendor,
+                    SUM(gross_total_coal_z_tot_p_val + gross_total_rail_z_tot_p_val) as total_cost,
+                    SUM(gr_qty) as quantity
+                FROM data
+                GROUP BY 1
+                ORDER BY 2 DESC
+                LIMIT 15
             """
         }
         
